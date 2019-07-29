@@ -1,6 +1,6 @@
-from __future__ import unicode_literals
 import json
 from contextlib import contextmanager
+
 from django.db import models, transaction, connection
 from django.conf.urls import url
 from django.contrib import admin, messages
@@ -16,6 +16,7 @@ from django.utils.timezone import template_localtime
 from django.utils.translation import ugettext as _
 from django.utils.encoding import force_text
 from django.utils.formats import localize
+
 from reversion.errors import RevertError
 from reversion.models import Version
 from reversion.revisions import is_active, register, is_registered, set_comment, create_revision, set_user
@@ -66,6 +67,7 @@ class VersionAdmin(admin.ModelAdmin):
 
     def log_addition(self, request, object, change_message=None):
         change_message = change_message or _("Initial version.")
+
         if is_active():
             # If https://code.djangoproject.com/ticket/27218 is implemented, we
             # could first call super() and get the change_message from the returned
@@ -74,6 +76,7 @@ class VersionAdmin(admin.ModelAdmin):
                 set_comment(json.dumps(change_message))
             else:
                 set_comment(change_message)
+
         super(VersionAdmin, self).log_addition(request, object, change_message)
 
     def log_change(self, request, object, message):
@@ -163,17 +166,21 @@ class VersionAdmin(admin.ModelAdmin):
             return super(VersionAdmin, self).change_view(request, object_id, form_url, extra_context)
 
     def _reversion_revisionform_view(self, request, version, template_name, extra_context=None):
+
         # Check that database transactions are supported.
         if not connection.features.uses_savepoints:
             raise ImproperlyConfigured("Cannot use VersionAdmin with a database that does not support savepoints.")
+
         # Run the view.
         try:
             with transaction.atomic(using=version.db):
                 # Revert the revision.
                 version.revision.revert(delete=True)
+
                 # Run the normal changeform view.
                 with self.create_revision(request):
                     response = self.changeform_view(request, quote(version.object_id), request.path, extra_context)
+
                     # Decide on whether the keep the changes.
                     if request.method == "POST" and response.status_code == 302:
                         set_comment(_("Reverted to previous version, saved on %(datetime)s") % {
@@ -193,10 +200,12 @@ class VersionAdmin(admin.ModelAdmin):
 
     def recover_view(self, request, version_id, extra_context=None):
         """Displays a form that can recover a deleted model."""
+
         # The revisionform view will check for change permission (via changeform_view),
         # but we also need to check for add permissions here.
         if not self.has_add_permission(request):
             raise PermissionDenied
+
         # Render the recover view.
         version = get_object_or_404(Version, pk=version_id)
         context = {
@@ -237,14 +246,17 @@ class VersionAdmin(admin.ModelAdmin):
 
     def recoverlist_view(self, request, extra_context=None):
         """Displays a deleted model to allow recovery."""
+
         # Check if user has change and add permissions for model
         if not self.has_change_permission(request) or not self.has_add_permission(request):
             raise PermissionDenied
         model = self.model
         opts = model._meta
         deleted = self._reversion_order_version_queryset(Version.objects.get_deleted(self.model))
+
         # Set the app name.
         request.current_app = self.admin_site.name
+
         # Get the rest of the context.
         context = dict(
             self.admin_site.each_context(request),
@@ -263,6 +275,7 @@ class VersionAdmin(admin.ModelAdmin):
 
     def history_view(self, request, object_id, extra_context=None):
         """Renders the history view."""
+
         # Check if user has view or change permissions for model
         if hasattr(self, 'has_view_or_change_permission'):  # for Django >= 2.1
             if not self.has_view_or_change_permission(request):
@@ -286,6 +299,7 @@ class VersionAdmin(admin.ModelAdmin):
                 unquote(object_id),  # Underscores in primary key get quoted to "_5F"
             ).select_related("revision__user"))
         ]
+
         # Compile the context.
         context = {"action_list": action_list}
         context.update(extra_context or {})

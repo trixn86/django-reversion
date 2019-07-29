@@ -1,16 +1,17 @@
-from __future__ import unicode_literals
 from collections import namedtuple, defaultdict
 from contextlib import contextmanager
 from functools import wraps
 from threading import local
+
 from django.apps import apps
 from django.core import serializers
 from django.core.exceptions import ObjectDoesNotExist
 from django.db import models, transaction, router
 from django.db.models.query import QuerySet
-from django.db.models.signals import post_save, m2m_changed
+from django.db.models.signals import post_save, m2m_changed, post_delete
 from django.utils.encoding import force_text
 from django.utils import timezone, six
+
 from reversion.errors import RevisionManagementError, RegistrationError
 from reversion.signals import pre_revision_commit, post_revision_commit
 
@@ -18,7 +19,6 @@ from reversion.signals import pre_revision_commit, post_revision_commit
 _VersionOptions = namedtuple("VersionOptions", (
     "fields",
     "follow",
-    "format",
     "for_concrete_model",
     "ignore_duplicates",
 ))
@@ -157,67 +157,73 @@ def _follow_relations(obj):
 
 
 def _follow_relations_recursive(obj):
+
     def do_follow(obj):
         if obj not in relations:
             relations.add(obj)
             for related in _follow_relations(obj):
                 do_follow(related)
+
     relations = set()
     do_follow(obj)
     return relations
 
 
-def _add_to_revision(obj, using, model_db, explicit):
+def _add_to_revision(obj, type, using, model_db, explicit):
     from reversion.models import Version
+
     # Exit early if the object is not fully-formed.
     if obj.pk is None:
         return
+
     version_options = _get_options(obj.__class__)
     content_type = _get_content_type(obj.__class__, using)
     object_id = force_text(obj.pk)
     version_key = (content_type, object_id)
+
     # If the obj is already in the revision, stop now.
     db_versions = _current_frame().db_versions
     versions = db_versions[using]
     if version_key in versions and not explicit:
         return
+
     # Get the version data.
     version = Version(
         content_type=content_type,
         object_id=object_id,
+        type=type,
         db=model_db,
-        format=version_options.format,
-        serialized_data=serializers.serialize(
-            version_options.format,
-            (obj,),
-            fields=version_options.fields,
-        ),
+        data=serializers.serialize('python', (obj,), fields=version_options.fields),
         object_repr=force_text(obj),
     )
+
     # If the version is a duplicate, stop now.
     if version_options.ignore_duplicates and explicit:
         previous_version = Version.objects.using(using).get_for_object(obj, model_db=model_db).first()
         if previous_version and previous_version._local_field_dict == version._local_field_dict:
             return
+
     # Store the version.
     db_versions = _copy_db_versions(db_versions)
     db_versions[using][version_key] = version
     _update_frame(db_versions=db_versions)
+
     # Follow relations.
     for follow_obj in _follow_relations(obj):
-        _add_to_revision(follow_obj, using, model_db, False)
+        _add_to_revision(follow_obj, type, using, model_db, False)
 
 
-def add_to_revision(obj, model_db=None):
+def add_to_revision(obj, *, type, model_db=None):
     model_db = model_db or router.db_for_write(obj.__class__, instance=obj)
     for db in _current_frame().db_versions.keys():
-        _add_to_revision(obj, db, model_db, True)
+        _add_to_revision(obj, type, db, model_db, True)
 
 
 def _save_revision(versions, user=None, comment="", meta=(), date_created=None, using=None):
     from reversion.models import Revision
+
     # Only save versions that exist in the database.
-    # Use _base_manager so we don't have problems when _default_manager is overriden
+    # Use _base_manager so we don't have problems when _default_manager is overridden
     model_db_pks = defaultdict(lambda: defaultdict(set))
     for version in versions:
         model_db_pks[version._model][version.db].add(version.object_id)
@@ -235,33 +241,32 @@ def _save_revision(versions, user=None, comment="", meta=(), date_created=None, 
         version for version in versions
         if version.object_id in model_db_existing_pks[version._model][version.db]
     ]
+
     # Bail early if there are no objects to save.
     if not versions:
         return
+
     # Save a new revision.
-    revision = Revision(
-        date_created=date_created,
-        user=user,
-        comment=comment,
-    )
+    revision = Revision(date_created=date_created, user=user, comment=comment)
+
     # Send the pre_revision_commit signal.
-    pre_revision_commit.send(
-        sender=create_revision,
-        revision=revision,
-        versions=versions,
-    )
+    pre_revision_commit.send(sender=create_revision, revision=revision, versions=versions)
+
     # Save the revision.
     revision.save(using=using)
+
     # Save version models.
     for version in versions:
         version.revision = revision
         version.save(using=using)
+
     # Save the meta information.
     for meta_model, meta_fields in meta:
         meta_model._base_manager.db_manager(using=using).create(
             revision=revision,
             **meta_fields
         )
+
     # Send the post_revision_commit signal.
     post_revision_commit.send(
         sender=create_revision,
@@ -282,6 +287,7 @@ def _create_revision_context(manage_manually, using, atomic):
         context = transaction.atomic(using=using) if atomic else _dummy_context()
         with context:
             yield
+
             # Only save for a db if that's the last stack frame for that db.
             if not any(using in frame.db_versions for frame in _local.stack[:-1]):
                 current_frame = _current_frame()
@@ -324,14 +330,28 @@ class _ContextWrapper(object):
         return do_revision_context
 
 
-def _post_save_receiver(sender, instance, using, **kwargs):
+def _post_save_receiver(sender, instance, using, created, **kwargs):
+    from .models import Version
+
     if is_registered(sender) and is_active() and not is_manage_manually():
-        add_to_revision(instance, model_db=using)
+        add_to_revision(
+            instance,
+            type=Version.TYPE_CREATE if created else Version.TYPE_UPDATE,
+            model_db=using,
+        )
+
+
+def _post_delete_receiver(sender, instance, using):
+    from .models import Version
+
+    if is_registered(sender) and is_active() and not is_manage_manually():
+        add_to_revision(instance, type=Version.TYPE_DELETE, model_db=using)
 
 
 def _m2m_changed_receiver(instance, using, action, model, reverse, **kwargs):
     if action.startswith("post_") and not reverse:
         if is_registered(instance) and is_active() and not is_manage_manually():
+            # TODO determine type
             add_to_revision(instance, model_db=using)
 
 
@@ -352,6 +372,7 @@ def get_registered_models():
 
 def _get_senders_and_signals(model):
     yield model, post_save, _post_save_receiver
+    yield model, post_delete, _post_delete_receiver
     opts = model._meta.concrete_model._meta
     for field in opts.local_many_to_many:
         m2m_model = field.remote_field.through
@@ -364,14 +385,14 @@ def _get_senders_and_signals(model):
         yield m2m_model, m2m_changed, _m2m_changed_receiver
 
 
-def register(model=None, fields=None, exclude=(), follow=(), format="json",
-             for_concrete_model=True, ignore_duplicates=False):
+def register(model=None, fields=None, exclude=(), follow=(), for_concrete_model=True, ignore_duplicates=False):
     def register(model):
         # Prevent multiple registration.
         if is_registered(model):
             raise RegistrationError("{model} has already been registered with django-reversion".format(
                 model=model,
             ))
+
         # Parse fields.
         opts = model._meta.concrete_model._meta
         version_options = _VersionOptions(
@@ -386,20 +407,24 @@ def register(model=None, fields=None, exclude=(), follow=(), format="json",
                 if field_name not in exclude
             ),
             follow=tuple(follow),
-            format=format,
             for_concrete_model=for_concrete_model,
             ignore_duplicates=ignore_duplicates,
         )
+
         # Register the model.
         _registered_models[_get_registration_key(model)] = version_options
+
         # Connect signals.
         for sender, signal, signal_receiver in _get_senders_and_signals(model):
             signal.connect(signal_receiver, sender=sender)
+
         # All done!
         return model
+
     # Return a class decorator if model is not given
     if model is None:
         return register
+
     # Register the model.
     return register(model)
 
@@ -419,6 +444,7 @@ def _get_options(model):
 def unregister(model):
     _assert_registered(model)
     del _registered_models[_get_registration_key(model)]
+
     # Disconnect signals.
     for sender, signal, signal_receiver in _get_senders_and_signals(model):
         signal.disconnect(signal_receiver, sender=sender)
