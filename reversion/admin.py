@@ -1,14 +1,14 @@
 import json
 from contextlib import contextmanager
 
-from django.db import models, transaction, connection
+from django.db import models, transaction
 from django.conf.urls import url
 from django.contrib import admin, messages
 from django.contrib.admin import options
 from django.contrib.admin.utils import unquote, quote
 from django.contrib.contenttypes.admin import GenericInlineModelAdmin
 from django.contrib.contenttypes.fields import GenericRelation
-from django.core.exceptions import PermissionDenied, ImproperlyConfigured
+from django.core.exceptions import PermissionDenied
 from django.shortcuts import get_object_or_404, render, redirect
 from django.urls import reverse
 from django.utils.text import capfirst
@@ -166,10 +166,6 @@ class VersionAdmin(admin.ModelAdmin):
             return super(VersionAdmin, self).change_view(request, object_id, form_url, extra_context)
 
     def _reversion_revisionform_view(self, request, version, template_name, extra_context=None):
-
-        # Check that database transactions are supported.
-        if not connection.features.uses_savepoints:
-            raise ImproperlyConfigured("Cannot use VersionAdmin with a database that does not support savepoints.")
 
         # Run the view.
         try:
